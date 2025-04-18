@@ -1,0 +1,1029 @@
+---
+title: "FI vs FP imputation - HRS"
+output: html_notebook
+---
+Glen Pridham Apr 2024
+
+Script for imputing HRS data to use in FI vs FP
+
+MICE. Algorithm(s): 
+-causal CART
+-maybe 2-level model - too slow
+  -try logistic regression
+-maybe that's enough?
+
+```{r}
+outputDir = "/home/glen/analysis/fi_vs_fp"
+gRootDir = "/home/glen/Documents/r" #where scripts are
+gOutputDir=outputDir
+
+setwd(outputDir)
+print(getwd())
+
+source(sprintf("%s/nhanes.R",gRootDir),verbose=0)
+source(sprintf("%s/goodness_of_fit.R",gRootDir),verbose=0)
+source(sprintf("%s/pca.R",gRootDir),verbose=0)
+source(sprintf("%s/pca_fi.R",gRootDir),verbose=0)
+library("mice")
+```
+
+
+
+```{r}
+codex = read.csv(sprintf("%s/rand_fi.csv",outputDir),row.names=1)
+```
+
+```{r}
+fiVar = c("nhmliv", "shlt",   "hibpe",  "diabe",  "cancre", "lunge",  "hearte", "stroke", "arthre",
+          "walksa", "walk1a", "chaira", "climsa", "clim1a", "stoopa", "armsa",  "pusha",  "lifta",
+          "dimea","dressa", "dressh", "walkra", "walkre", "walkrh", "batha",  "bathh",  "eata",
+          "eath",   "beda",   "bede",   "bedh",   "toilta", "toilth", "shopa",  "phonea", "moneya",
+          "hosp",   "nrshom", "outpt",  "homcar", "spcfac")
+names(fiVar) = codex[fiVar,"Label"]
+
+fpVar = c('fp1_weight','fp2_grip','fp3_gait','fp4_exhaustion','fp5_low_activity')
+
+auxVar = c("age","sex") #"walk_time_ave","height","weight" # I'm worried about overfitting #"fi_prev" probably good but I'm concerned I'll get pushback
+```
+
+
+
+```{r}
+#8 is first wave, but keep 7 for carry forward / imputation
+  #nevermind, wave 7 has no FP data in it
+waves = 8:14 #no covid (I forget what's missing in early, some measurement like grip or gait)
+keepWaves = rep(T,length(waves))
+#keepWaves[1] = F #drop since no prev?
+keepWaves[1:2+length(keepWaves)-2] = F #won't have 'next'
+years = 1992+2*(waves-1)
+```
+
+FI analysis - df and d2f
+
+
+```{r}
+long = list()
+for (i in 1:length(waves))
+{
+
+  long[[i]] = read.csv(sprintf("%s/data/hrs_rand_preproc_wave%02d.csv",gOutputDir,waves[i]),row.names=1)
+  #must have age and FI
+  
+  #long[[i]][,sprintf("%s_next",fiVar)] = NA
+  #long[[i]][,sprintf("%s_next",fpVar)] = NA
+  #long[[i]][,"fi_next"] = NA
+  #long[[i]][,"Nfp_next"] = NA
+  long[[i]][,sprintf("%s_prev",fiVar)] = NA
+  long[[i]][,sprintf("%s_prev",fpVar)] = NA
+  long[[i]][,"fi_prev"] = NA
+  long[[i]][,"Nfp_prev"] = NA
+  long[[i]] = subset(long[[i]],!is.na(fi) & !is.na(age))
+  if(i> 1)
+  {
+    ids = intersect(rownames(long[[i-1]]),rownames(long[[i]]))
+    #long[[i-1]][ids,sprintf("%s_next",fiVar)] = long[[i]][ids,fiVar]
+    #long[[i-1]][ids,"fi_next"] = apply(long[[i]][ids,fiVar],1,mean,na.rm=T)
+    #long[[i-1]][ids,sprintf("%s_next",fpVar)] = long[[i]][ids,fpVar]
+    #long[[i-1]][ids,"fp_next"] = apply(long[[i]][ids,fpVar],1,sum,na.rm=T)
+    
+    long[[i]][ids,sprintf("%s_prev",fiVar)] = long[[i-1]][ids,fiVar]
+    long[[i]][ids,"fi_prev"] =          apply(long[[i-1]][ids,fiVar],1,mean,na.rm=T)
+    availfpVar = intersect(colnames(long[[i-1]]),fpVar)
+    print(availfpVar)
+    long[[i]][ids,sprintf("%s_prev",availfpVar)] = long[[i-1]][ids,availfpVar]
+    long[[i]][ids,"Nfp_prev"] =          apply(long[[i-1]][ids,availfpVar],1,mean,na.rm=T)*length(availfpVar)
+
+  }
+  
+}
+for (i in 1:length(long))
+{
+  if(i <= (length(long)-2)) #look forward by 2 since gait/grip are never measured back-to-back
+  {
+    ids = intersect(rownames(long[[i+2]]),rownames(long[[i]]))
+    long[[i]][ids,sprintf("%s_next",fiVar)] = long[[i+2]][ids,fiVar]
+    long[[i]][ids,"fi_next"] =          apply(long[[i+2]][ids,fiVar],1,mean,na.rm=T)
+    availfpVar = intersect(colnames(long[[i+2]]),fpVar)
+    print(availfpVar)
+    long[[i]][ids,sprintf("%s_next",availfpVar)] = long[[i+2]][ids,availfpVar]
+    long[[i]][ids,"Nfp_next"] =          apply(long[[i+2]][ids,availfpVar],1,mean,na.rm=T)*length(availfpVar)
+
+  }
+}
+long = do.call(rbind,long[keepWaves])
+
+#convert months to years
+long[,"age"] = long[,"age"]/12
+long[,"age_prev"] = long[,"age_prev"]/12
+long[,"age_prev_prev"] = long[,"age_prev_prev"]/12
+long[,"age_next"] = long[,"age_next"]/12
+long[,"death_age"] = long[,"death_age"]/12
+
+#convert sex to char
+sex = rep("unknown",nrow(long))
+sex[long[,"ragender"]==1] = "male"
+sex[long[,"ragender"]==2] = "female"
+long[,"sex"] = sex
+
+logi = is.na(long[,"fp2_grip"]) & is.na(long[,"fp3_gait"])
+print(sprintf("dropping %d entries with no grip and no gait",sum(logi))) #must have at least one
+long = long[!logi,]
+```
+
+
+```{r}
+hist(long[,"age"])
+```
+```{r}
+long[,"id"] = long[,"rahhidpn"]
+long[,"id"] = as.integer(long[,"id"]) #mice wants integer here or it gets mad
+
+long = long[,c("id","rahhidpn","wave","age","sex",fiVar,fpVar,sprintf("%s_prev",fiVar),sprintf("%s_prev",fpVar))]
+
+#'fix' types
+for (j in 1:length(fiVar))
+{
+  long[,fiVar[j]] = as.integer(long[,fiVar[j]])
+  long[,sprintf("%s_prev",fiVar[j])] = as.integer(long[,sprintf("%s_prev",fiVar[j])])
+  #long[,fiVar[j]] = ordered(long[,fiVar[j]])
+  #long[,sprintf("%s_prev",fiVar[j])] = ordered(long[,sprintf("%s_prev",fiVar[j])])
+}
+for (j in 1:length(fpVar))
+{
+  long[,fpVar[j]] = as.integer(long[,fpVar[j]])
+  long[,sprintf("%s_prev",fpVar[j])] = as.integer(long[,sprintf("%s_prev",fpVar[j])])
+  #long[,fpVar[j]] = ordered(long[,fpVar[j]])
+  #long[,sprintf("%s_prev",fpVar[j])] = ordered(long[,sprintf("%s_prev",fpVar[j])])
+}
+```
+
+```{r}
+
+contImp = NULL
+binImp = setdiff(c(fiVar,fpVar,sprintf("%s_prev",c(fiVar,fpVar))),contImp)
+
+pred = make.predictorMatrix(long)
+pred[,"wave"] = 0 #don't predict wave
+
+
+#basic linear models
+meth = make.method(long)
+meth[1:length(meth)] = ""
+meth[binImp] = "logreg"
+meth[contImp] = "norm" #"2l.norm" #"2l.norm" #2l.pan doesn't allow missing values in predictors
+print(meth)
+```
+
+```{r}
+predCart = make.predictorMatrix(long)
+
+methCart = make.method(long,defaultMethod="cart")
+methCart["wave"] = ""
+methCart[c(binImp,contImp)] = "cart"
+
+print(methCart) #some may have no NAs in which case they default to ""
+```
+
+split linear
+```{r}
+save = T
+load = T
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_lin_fp.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  ml_fp = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fpVar,sprintf("%s_prev",fpVar),"age","sex","wave","id")
+  ml_fp = mice(long[,vars], meth = meth[vars],pred=pred[vars,vars], m = 15, print = T)
+  if(save) saveRDS(ml_fp,file)
+}
+
+
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_lin_fi.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  ml_fi = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fiVar,sprintf("%s_prev",fiVar),"age","sex","wave","id")
+  ml_fi = mice(long[,vars], meth = meth[vars],pred=pred[vars,vars], m = 15, print = T)
+  if(save) saveRDS(ml_fi,file)
+}
+
+
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_lin_fpfi.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  ml_fpfi = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fpVar,sprintf("%s_prev",fpVar),fiVar,sprintf("%s_prev",fiVar),"age","sex","wave","id")
+  ml_fpfi = mice(long[,vars], meth = meth[vars],pred=pred[vars,vars], m = 15, print = T)
+  if(save) saveRDS(ml_fpfi,file)
+}
+
+```
+
+check
+what can we test?
+-individual trajectories
+-binary outcome frequencies
+-Nfp / FI trajectories
+
+start with individual variables
+```{r}
+library(colorspace)
+fp = list()
+C = list() #correlation
+Cv = list() #covariance
+Cvi = list() #covariance - imputed values only
+mu = list()
+age_cuts = seq(min(long[,"age"])-1,max(long[,"age"])+1,length=10)
+agg = list()
+aggse = list()
+agg_fpvar = list() #one per fpvar
+agg_fpvar_se = list()
+for (j in 1:length(fpVar)) 
+{
+  agg_fpvar[[j]] = list()
+  agg_fpvar_se[[j]]  = list()
+}
+for (i in 1:ml_fp$m)
+{
+  fp[[i]] = mice::complete(ml_fp,i)[,c("id","age","sex","wave",fpVar)]
+  fp[[i]][,"imp"] = i
+  fp[[i]][,"Nfp"] = apply(fp[[i]][,fpVar],1,mean,na.rm=T)*length(fpVar)
+  fp[[i]][,"Nfp_noimp"] = apply(long[,fpVar],1,mean,na.rm=T)*length(fpVar)
+  fp[[i]][,sprintf("%s_imputed",fpVar)] = ml_fp$where[,fpVar]
+  fp[[i]][,"N_imputed"] = apply(ml_fp$where[,fpVar],1,sum)
+  C[[i]] = cor(mice::complete(ml_fp,i)[,c("age",fpVar,sprintf("%s_prev",fpVar))])
+  Cv[[i]] = cov(mice::complete(ml_fp,i)[,c("age",fpVar,sprintf("%s_prev",fpVar))])
+  temp = mice::complete(ml_fp,i)[,c(fpVar,sprintf("%s_prev",fpVar))]
+  temp[!ml_fp$where[,c(fpVar,sprintf("%s_prev",fpVar))]] = NA
+  Cvi[[i]] = cov(temp,use='pairwise.complete')
+  mu[[i]] = apply(mice::complete(ml_fp,i)[,c("age",fpVar,sprintf("%s_prev",fpVar))],2,mean,na.rm=T)
+  m = matrix(NA,nrow=length(mu[[i]]),ncol=2)
+  m[,1] = mu[[i]]
+  m[,2] = mu[[i]]
+  mu[[i]] = m
+  
+  
+  fp[[i]][,"age_cut"] = as.numeric(as.character(cut(fp[[i]][,"age"],age_cuts,labels=age_cuts[-1]/2+age_cuts[-length(age_cuts)]/2,include.lowest=T)))
+  
+  vars = c("age",fpVar,"Nfp","Nfp_noimp")
+  agg[[i]] = aggregate(fp[[i]][,vars],by=list(sex=fp[[i]][,"sex"],Nimp=fp[[i]][,"N_imputed"],age_cut=fp[[i]][,"age_cut"]),mean,na.rm=T)
+  aggse[[i]] = aggregate(fp[[i]][,vars],by=list(sex=fp[[i]][,"sex"],Nimp=fp[[i]][,"N_imputed"],age_cut=fp[[i]][,"age_cut"]),SEM,na.rm=T)
+  agg[[i]][,"N"] = aggregate(fp[[i]][,"age"],by=list(sex=fp[[i]][,"sex"],Nimp=fp[[i]][,"N_imputed"],age_cut=fp[[i]][,"age_cut"]),length)[,"x"]
+  agg[[i]][,"sex"] = as.numeric(factor(agg[[i]][,"sex"]),c("male","female"))-1
+  aggse[[i]][,"N"] = 0
+  aggse[[i]][,"sex"] = 0
+
+  for(j in 1:length(fpVar))
+  {
+    agg_fpvar[[j]][[i]] = aggregate(fp[[i]][,fpVar[j]],by=list(sex=fp[[i]][,"sex"],imp=ml_fp$where[,fpVar[j]],age_cut=fp[[i]][,"age_cut"]),mean,na.rm=T)
+    agg_fpvar_se[[j]][[i]] = aggregate(fp[[i]][,fpVar[j]],by=list(sex=fp[[i]][,"sex"],imp=ml_fp$where[,fpVar[j]],age_cut=fp[[i]][,"age_cut"]),SEM,na.rm=T)
+    agg_fpvar[[j]][[i]][,"N"] = aggregate(fp[[i]][,fpVar[j]],by=list(sex=fp[[i]][,"sex"],imp=ml_fp$where[,fpVar[j]],age_cut=fp[[i]][,"age_cut"]),length)[,"x"]
+    agg_fpvar[[j]][[i]][,"sex"] = as.numeric(factor(agg_fpvar[[j]][[i]][,"sex"]),c("male","female"))-1
+    agg_fpvar_se[[j]][[i]][,"N"] = 0
+    agg_fpvar_se[[j]][[i]][,"sex"] = 0
+  }
+
+}
+fp = do.call(rbind,fp)
+C = RubinMat(C)
+Cv = RubinMat(Cv)
+Cvi = RubinMat(Cvi)
+mu = RubinMat(mu)
+
+agg = RubinMat(agg,lse=aggse)
+vars = c(fpVar,"Nfp","Nfp_noimp")
+agg[[1]] = as.data.frame(agg[[1]])
+agg[[1]][,sprintf("%s_se",vars)] = agg[[2]][,vars]
+agg = agg[[1]]
+
+for (j in 1:length(fpVar))
+{
+  agg_fpvar[[j]] = RubinMat(agg_fpvar[[j]],agg_fpvar_se[[j]])
+  agg_fpvar[[j]][[1]] = as.data.frame(agg_fpvar[[j]][[1]])
+  agg_fpvar[[j]][[1]][,sprintf("%s_se","x")] = agg_fpvar[[j]][[2]][,"x"]
+  agg_fpvar[[j]] = agg_fpvar[[j]][[1]]
+}
+
+
+
+#
+ggplot(subset(agg,sex==0),aes(x=age_cut,y=fp1_weight,ymin=fp1_weight-fp1_weight_se,ymax=fp1_weight+fp1_weight_se,color=as.ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F,method="lm")+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red") #Blue-Red 3
+
+ggplot(subset(agg,sex==1),aes(x=age,y=fp1_weight,ymin=fp1_weight-fp1_weight_se,ymax=fp1_weight+fp1_weight_se,color=as.ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F,method="lm")+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red") #Blue-Red 3
+
+```
+
+```{r}
+vars = fpVar
+xlim = c(0,.5)
+g = list()
+g[[1]] = TilePlot(cov(long[,vars],use='complete.obs'),range=xlim)+ggtitle("Complete-case")
+g[[2]] = TilePlot(cov(long[,vars],use='pairwise.complete'),range=xlim)+ggtitle("Available-case")
+g[[3]] = TilePlot(Cv[[1]][vars,vars],dm=Cv[[2]][vars,vars],range=xlim)+ggtitle("Imputed - logreg")
+g[[4]] = TilePlot(Cvi[[1]][vars,vars],dm=Cvi[[2]][vars,vars],range=xlim)+ggtitle("Imputed only - logreg")
+marrangeGrob(g,nrow=1,ncol=4,top="Covariance")
+#marrangeGrob(g,nrow=2,ncol=2,top="Covariance")
+
+vars = c(fpVar,sprintf("%s_prev",fpVar))
+g = list()
+g[[1]] = TilePlot(cov(long[,vars],use='pairwise.complete'),range=xlim)+ggtitle("Available-case")
+g[[2]] = TilePlot(Cv[[1]][vars,vars],dm=Cv[[2]][vars,vars],range=xlim)+ggtitle("Imputed - logreg")
+g[[3]] = TilePlot(Cvi[[1]][vars,vars],dm=Cvi[[2]][vars,vars],range=xlim)+ggtitle("Imputed only - logreg")
+marrangeGrob(g,nrow=1,ncol=3,top="Covariance")
+#marrangeGrob(g,nrow=2,ncol=2,top="Covariance")
+```
+
+```{r}
+library(mgcv)
+gm =  list()
+testage = seq(min(long[,"age"],na.rm=T)-1,max(long[,"age"],na.rm=T)+1,lenght=101)
+for (j in 1:length(agg_fpvar))
+{
+  fitdata = subset(agg_fpvar[[j]], N > 1 & sex==0 & imp == 0 & x > 0 & x_se > 0)
+  #mexp = lm(log(x)~age_cut,fitdata,weights=1/fitdata[,"x_se"]^2)
+  #g = gam(x~s(age_cut,3),data=fitdata,weights=1/fitdata[,"x_se"]^2)
+  
+  Nimp = sum(ml_fp$where[,fpVar[j]])
+  if(Nimp > 1)
+  {
+    gm[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==0),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se,color=ordered(imp)))
+  }
+  else gm[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==0),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se))
+  gm[[j]] = gm[[j]] +  geom_pointrange(position=position_dodge(1))+
+  #geom_smooth(method="lm",data=subset(agg_fpvar[[j]],N>1 & imp==0),aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  #geom_smooth(data=subset(agg_fpvar[[j]], N > 1 & sex==0 & imp == 0),mapping=aes(x=age_cut,y=x),inherit.aes=F,se=F,lty=2,method="gam",formula=y~s(x,4))+
+  #geom_line(data=data.frame(age=testage,y=exp(predict(mexp,data.frame(age_cut=testage)))),aes(x=age,y=y),inherit.aes=F,lty=2,colour="black")+
+  #geom_line(data=data.frame(age=testage,y=exp(predict(g,data.frame(age_cut=testage)))),aes(x=age,y=y),inherit.aes=F,lty=2,colour="black")+
+  geom_smooth(data=fitdata,aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,se=F,size=1,fullrange=T)+
+  labs(x="Age",title=sprintf("%s (males)",fpVar[j]))+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+}
+
+gm[[length(gm)+1]] = ggplot(data=subset(agg,sex==0 & N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  ##scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+
+marrangeGrob(gm,nrow=2,ncol=3,top="males")
+
+gf =  list()
+for (j in 1:length(agg_fpvar))
+{
+    fitdata = subset(agg_fpvar[[j]], N > 1 & sex==1 & imp == 0 & x > 0 & x_se > 0)
+  Nimp = sum(ml_fp$where[,fpVar[j]])
+  if(Nimp > 1)
+  {
+    gf[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==1),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se,color=ordered(imp)))
+  }
+  else gf[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==1),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se))
+  gf[[j]] = gf[[j]] +  geom_pointrange(position=position_dodge(1))+
+  #geom_smooth(method="lm",data=subset(agg_fpvar[[j]],N>1 & imp==0),aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  #geom_smooth()+
+  geom_smooth(data=fitdata,aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,se=F,size=1)+
+  labs(x="Age",title=sprintf("%s (females)",fpVar[j]))+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+}
+
+
+#females
+gf[[length(gf)+1]] = ggplot(data=subset(agg,sex==1 & N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  #scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+
+marrangeGrob(gf,nrow=2,ncol=3,top="females")
+
+
+save=T
+if(save)
+{   
+    ggsave(sprintf("%s/results/hrs_mice_lm_males_fp.pdf",outputDir),
+           marrangeGrob(gm,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+    ggsave(sprintf("%s/results/hrs_mice_lm_males_fp.png",outputDir),
+           marrangeGrob(gm,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+    
+      ggsave(sprintf("%s/results/hrs_mice_lm_females_fp.pdf",outputDir),
+           marrangeGrob(gf,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+    ggsave(sprintf("%s/results/hrs_mice_lm_females_fp.png",outputDir),
+           marrangeGrob(gf,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+}
+```
+
+
+# to do: check FI
+
+
+these ones are better
+```{r}
+library(colorspace)
+
+#pointless, so few options for values
+#ggplot(data=subset(fp,sex=="male"),aes(x=Nfp_noimp,y=Nfp,color=ordered(Nfp_imputed)))+
+#  geom_point()+
+  #geom_smooth(se=F)+
+#  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+#  theme_minimal()
+
+
+
+
+
+#combined sexes #doesn't include imputatoin error
+#ggplot(data=fp,aes(x=round(age,0),y=Nfp,color=ordered(N_imputed)))+
+#  stat_summary()+
+#  geom_smooth(se=F)+
+#  scale_y_log10()+
+#  annotation_logticks(sides="l")+
+#  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+#  theme_minimal()
+
+#males
+#note: errorbars aren't right for N=1 since sd -> NA gets ignored
+ggplot(data=subset(agg,sex==0 & N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+#females
+ggplot(data=subset(agg,sex==1 & N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+ggplot(data=subset(agg, N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp),shape=ordered(sex)),linetype=ordered(sex))+
+  geom_pointrange()+
+  #geom_smooth(se=F)+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+ggplot(data=subset(agg, N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp),shape=ordered(sex)),linetype=ordered(sex))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=Nfp,weight=1/Nfp_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+
+
+```
+
+```{r}
+library(colorspace)
+fi = list()
+for (i in 1:ml_fi$m)
+{
+  fi[[i]] = mice::complete(ml_fi,i)[,c("id","age","sex","wave",fiVar)]
+  fi[[i]][,"imp"] = i
+  fi[[i]][,"fi"] = apply(fi[[i]][,fiVar],1,mean,na.rm=T)
+  fi[[i]][,"fi_noimp"] = apply(long[,fiVar],1,mean,na.rm=T)
+  fi[[i]][,sprintf("%s_imputed",fiVar)] = ml_fp$where[,fiVar]
+  fi[[i]][,"N_imputed"] = apply(ml_fp$where[,fiVar],1,sum)
+}
+fi = do.call(rbind,fi)
+age_cuts = seq(min(fi[,"age"])-1,max(fi[,"age"])+1,length=8)
+fi[,"age_cut"] = cut(fi[,"age"],age_cuts,include.lowest=T)
+
+ggplot(data=subset(fi,sex=="male"),aes(x=round(age,0),y=fi,color=ordered(N_imputed)))+
+  stat_summary()+
+  geom_smooth(se=F)+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+ggplot(data=subset(fi,sex=="female"),aes(x=round(age,0),y=fi,color=ordered(N_imputed)))+
+  stat_summary()+
+  geom_smooth(se=F)+
+  scale_y_log10()+
+  annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+```
+
+split cart
+```{r}
+save = T
+load = T
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_cart_fp.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  mcart_fp = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fpVar,sprintf("%s_prev",fpVar),"age","sex","wave","id")
+  mcart_fp = mice(long[,vars], meth = methCart[vars],pred=predCart[vars,vars], m = 15, print = T)
+  if(save) saveRDS(mcart_fp,file)
+}
+
+
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_cart_fi.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  mcart_fi = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fiVar,sprintf("%s_prev",fiVar),"age","sex","wave","id")
+  mcart_fi = mice(long[,vars], meth = methCart[vars],pred=predCart[vars,vars], m = 15, print = T)
+  if(save) saveRDS(mcart_fi,file)
+}
+
+
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_cart_fpfi_markov.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  mcart_fpfi = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fpVar,sprintf("%s_prev",fpVar),fiVar,sprintf("%s_prev",fiVar),"age","sex","wave","id") #crashing
+  #vars = c(fpVar,sprintf("%s_prev",fpVar),fiVar,sprintf("%s_prev",fiVar),"age","sex","id") #also crashing
+  me = methCart[vars]
+  pr = predCart[vars,vars]
+  #pr[grep("prev",names(me)),] = 0 #don't impute back in time
+  #pr[grep("age",names(me)),] = 1
+  #pr[grep("sex",names(me)),] = 1
+  #pr[grep("wave",names(me)),] = 1
+  #me[grep("prev",names(me))] = "" #don't impute prev #pretty sure this won't work
+  mcart_fpfi = mice(long[,vars], meth = me,pred=pr, m = 15, print = T)
+  if(save) saveRDS(mcart_fpfi,file)
+}
+
+file = sprintf("%s/data/hrs_rand_fi_vs_fp_mice_cart_fpfi.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  mcart_fpfi2 = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  vars = c(fpVar,fiVar,"age","sex","wave","id")
+  me = methCart[vars]
+  pr = predCart[vars,vars]
+  mcart_fpfi2 = mice(long[,vars], meth = me,pred=pr, m = 15, print = T)
+  if(save) saveRDS(mcart_fpfi2,file)
+}
+```
+
+```{r}
+mmice = mcart_fpfi2
+library(colorspace)
+fp = list()
+fi = list()
+C = list() #correlation
+Cv = list() #covariance
+Cvi = list() #covariance - imputed values only
+mu = list()
+age_cuts = seq(min(long[,"age"])-1,max(long[,"age"])+1,length=10)
+imp_cuts = seq(0,100,length=5) #for FI
+agg = list()
+aggse = list()
+aggfi = list()
+aggfise = list()
+agg_fpvar = list() #one per fpvar
+agg_fpvar_se = list()
+for (j in 1:length(fpVar)) 
+{
+  agg_fpvar[[j]] = list()
+  agg_fpvar_se[[j]]  = list()
+}
+for (i in 1:mmice$m)
+{
+  fp[[i]] = mice::complete(mmice,i)[,c("id","age","sex","wave",fpVar)]
+  fp[[i]][,"imp"] = i
+  fp[[i]][,"Nfp"] = apply(fp[[i]][,fpVar],1,mean,na.rm=T)*length(fpVar)
+  fp[[i]][,"Nfp_noimp"] = apply(long[,fpVar],1,mean,na.rm=T)*length(fpVar)
+  fp[[i]][,sprintf("%s_imputed",fpVar)] = mmice$where[,fpVar]
+  fp[[i]][,"N_imputed"] = apply(mmice$where[,fpVar],1,sum)
+  C[[i]] = cor(mice::complete(mmice,i)[,c("age",fpVar)])
+  Cv[[i]] = cov(mice::complete(mmice,i)[,c("age",fpVar)])
+  temp = mice::complete(mmice,i)[,c(fpVar)]
+  temp[!mmice$where[,c(fpVar)]] = NA
+  Cvi[[i]] = cov(temp,use='pairwise.complete')
+  mu[[i]] = apply(mice::complete(mmice,i)[,c("age",fpVar)],2,mean,na.rm=T)
+  m = matrix(NA,nrow=length(mu[[i]]),ncol=2)
+  m[,1] = mu[[i]]
+  m[,2] = mu[[i]]
+  mu[[i]] = m
+  
+  
+  fp[[i]][,"age_cut"] = as.numeric(as.character(cut(fp[[i]][,"age"],age_cuts,labels=age_cuts[-1]/2+age_cuts[-length(age_cuts)]/2,include.lowest=T)))
+  
+  vars = c("age",fpVar,"Nfp","Nfp_noimp")
+  agg[[i]] = aggregate(fp[[i]][,vars],by=list(sex=fp[[i]][,"sex"],Nimp=fp[[i]][,"N_imputed"],age_cut=fp[[i]][,"age_cut"]),mean,na.rm=T)
+  aggse[[i]] = aggregate(fp[[i]][,vars],by=list(sex=fp[[i]][,"sex"],Nimp=fp[[i]][,"N_imputed"],age_cut=fp[[i]][,"age_cut"]),SEM,na.rm=T)
+  agg[[i]][,"N"] = aggregate(fp[[i]][,"age"],by=list(sex=fp[[i]][,"sex"],Nimp=fp[[i]][,"N_imputed"],age_cut=fp[[i]][,"age_cut"]),length)[,"x"]
+  agg[[i]][,"sex"] = as.numeric(factor(agg[[i]][,"sex"]),c("male","female"))-1
+  aggse[[i]][,"N"] = 0
+  aggse[[i]][,"sex"] = 0
+
+  for(j in 1:length(fpVar))
+  {
+    agg_fpvar[[j]][[i]] = aggregate(fp[[i]][,fpVar[j]],by=list(sex=fp[[i]][,"sex"],imp=mmice$where[,fpVar[j]],age_cut=fp[[i]][,"age_cut"]),mean,na.rm=T)
+    agg_fpvar_se[[j]][[i]] = aggregate(fp[[i]][,fpVar[j]],by=list(sex=fp[[i]][,"sex"],imp=mmice$where[,fpVar[j]],age_cut=fp[[i]][,"age_cut"]),SEM,na.rm=T)
+    agg_fpvar[[j]][[i]][,"N"] = aggregate(fp[[i]][,fpVar[j]],by=list(sex=fp[[i]][,"sex"],imp=mmice$where[,fpVar[j]],age_cut=fp[[i]][,"age_cut"]),length)[,"x"]
+    agg_fpvar[[j]][[i]][,"sex"] = as.numeric(factor(agg_fpvar[[j]][[i]][,"sex"]),c("male","female"))-1
+    agg_fpvar_se[[j]][[i]][,"N"] = 0
+    agg_fpvar_se[[j]][[i]][,"sex"] = 0
+  }
+  
+  
+  fi[[i]] = mice::complete(mmice,i)[,c("id","age","sex","wave",fiVar)]
+  fi[[i]][,"imp"] = i
+  fi[[i]][,"fi"] = apply(fi[[i]][,fiVar],1,mean,na.rm=T)
+  fi[[i]][,"fi_noimp"] = apply(long[,fiVar],1,mean,na.rm=T)
+  fi[[i]][,sprintf("%s_imputed",fiVar)] = mmice$where[,fiVar]
+  fi[[i]][,"N_imputed"] = apply(mmice$where[,fiVar],1,sum)
+  
+  fi[[i]][,"age_cut"] = as.numeric(as.character(cut(fi[[i]][,"age"],age_cuts,labels=age_cuts[-1]/2+age_cuts[-length(age_cuts)]/2,include.lowest=T)))
+  fi[[i]][,"percent_imp_cut"] = as.numeric(as.character(cut(fi[[i]][,"N_imputed"]/length(fiVar)*100,imp_cuts,labels=round(imp_cuts[-1]/2+imp_cuts[-length(imp_cuts)]/2),include.lowest=T)))
+  aggfi[[i]] = aggregate(fi[[i]][,c("fi","fi_noimp","N_imputed")],by=list(sex=fi[[i]][,"sex"],percent_imp_cut=fi[[i]][,"percent_imp_cut"],age_cut=fi[[i]][,"age_cut"]),mean,na.rm=T)
+  aggfise[[i]] = aggregate(fi[[i]][,c("fi","fi_noimp","N_imputed")],by=list(sex=fi[[i]][,"sex"],percent_imp_cut=fi[[i]][,"percent_imp_cut"],age_cut=fi[[i]][,"age_cut"]),SEM,na.rm=T)
+  aggfi[[i]][,"N"] = aggregate(fi[[i]][,"age"],by=list(sex=fi[[i]][,"sex"],percent_imp_cut=fi[[i]][,"percent_imp_cut"],age_cut=fi[[i]][,"age_cut"]),length)[,"x"]
+  aggfi[[i]][,"sex"] = as.numeric(factor(aggfi[[i]][,"sex"]),c("male","female"))-1
+  aggfise[[i]][,"N"] = 0
+  aggfise[[i]][,"sex"] = 0
+
+}
+fp = do.call(rbind,fp)
+fi = do.call(rbind,fi)
+C = RubinMat(C)
+Cv = RubinMat(Cv)
+Cvi = RubinMat(Cvi)
+mu = RubinMat(mu)
+
+agg = RubinMat(agg,lse=aggse)
+vars = c(fpVar,"Nfp","Nfp_noimp")
+agg[[1]] = as.data.frame(agg[[1]])
+agg[[1]][,sprintf("%s_se",vars)] = agg[[2]][,vars]
+agg = agg[[1]]
+
+aggfi = RubinMat(aggfi,lse=aggfise)
+vars = c("fi","fi_noimp")
+aggfi[[1]] = as.data.frame(aggfi[[1]])
+aggfi[[1]][,sprintf("%s_se",vars)] = aggfi[[2]][,vars]
+aggfi = aggfi[[1]]
+
+for (j in 1:length(fpVar))
+{
+  agg_fpvar[[j]] = RubinMat(agg_fpvar[[j]],agg_fpvar_se[[j]])
+  agg_fpvar[[j]][[1]] = as.data.frame(agg_fpvar[[j]][[1]])
+  agg_fpvar[[j]][[1]][,sprintf("%s_se","x")] = agg_fpvar[[j]][[2]][,"x"]
+  agg_fpvar[[j]] = agg_fpvar[[j]][[1]]
+}
+
+
+
+```
+```{r}
+#gm = ggplot(data=subset(aggfi,sex==0 & N > 1),aes(x=age_cut,y=fi,ymin=fi-fi_se,ymax=fi+fi_se,color=ordered(Nimp)))+
+gm = ggplot(data=subset(aggfi,sex==0 & N > 1),aes(x=age_cut,y=fi,ymin=fi-fi_se,ymax=fi+fi_se,color=ordered(percent_imp_cut)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  ##scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  ggtitle("Males")+
+  theme_minimal()
+gm
+
+plotdata = list()
+plotdata[[1]] = subset(aggfi,sex==0 & N > 1)
+plotdata[[1]][,"group"] = "mice"
+plotdata[[2]] = subset(aggfi,sex==0 & N > 1)
+plotdata[[2]][,"fi"] = plotdata[[2]][,"fi_noimp"]
+plotdata[[2]][,"fi_se"] = plotdata[[2]][,"fi_noimp_se"]
+plotdata[[2]][,"group"] = "ignore"
+plotdata = do.call(rbind,plotdata)
+
+gm2 = ggplot(data=plotdata,aes(x=age_cut,y=fi,ymin=fi-fi_se,ymax=fi+fi_se,color=ordered(group)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  ##scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  ggtitle("Males")+
+  theme_minimal()
+
+#gm2
+
+
+#gf = ggplot(data=subset(aggfi,sex==1 & N > 1),aes(x=age_cut,y=fi,ymin=fi-fi_se,ymax=fi+fi_se,color=ordered(Nimp)))+
+gf = ggplot(data=subset(aggfi,sex==1 & N > 1),aes(x=age_cut,y=fi,ymin=fi-fi_se,ymax=fi+fi_se,color=ordered(percent_imp_cut)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  ##scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  ggtitle("Females")+
+  theme_minimal()
+gf
+
+plotdata = list()
+plotdata[[1]] = subset(aggfi,sex==1 & N > 1)
+plotdata[[1]][,"group"] = "mice"
+plotdata[[2]] = subset(aggfi,sex==1 & N > 1)
+plotdata[[2]][,"fi"] = plotdata[[2]][,"fi_noimp"]
+plotdata[[2]][,"fi_se"] = plotdata[[2]][,"fi_noimp_se"]
+plotdata[[2]][,"group"] = "ignore"
+plotdata = do.call(rbind,plotdata)
+
+gf2 = ggplot(data=plotdata,aes(x=age_cut,y=fi,ymin=fi-fi_se,ymax=fi+fi_se,color=ordered(group)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  ##scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+#gf2
+
+save=T
+if(save)
+{   
+    ggsave(sprintf("%s/results/hrs_mice_cart_fi.pdf",outputDir),
+           marrangeGrob(list(gm,gf),nrow=1,ncol=2,top=NULL),width=16,height=7,dpi=300)
+    ggsave(sprintf("%s/results/hrs_mice_cart_fi.png",outputDir),
+           marrangeGrob(list(gm,gf),nrow=2,ncol=2,top=NULL),width=16,height=7,dpi=300)
+}
+```
+
+```{r}
+library(mgcv)
+gm =  list()
+testage = seq(min(long[,"age"],na.rm=T)-1,max(long[,"age"],na.rm=T)+1,lenght=101)
+for (j in 1:length(agg_fpvar))
+{
+  fitdata = subset(agg_fpvar[[j]], N > 1 & sex==0 & imp == 0 & x > 0 & x_se > 0)
+  #mexp = lm(log(x)~age_cut,fitdata,weights=1/fitdata[,"x_se"]^2)
+  #g = gam(x~s(age_cut,3),data=fitdata,weights=1/fitdata[,"x_se"]^2)
+  
+  Nimp = sum(mmice$where[,fpVar[j]])
+  if(Nimp > 1)
+  {
+    gm[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==0),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se,color=ordered(imp)))
+  }
+  else gm[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==0),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se))
+  gm[[j]] = gm[[j]] +  geom_pointrange(position=position_dodge(1))+
+  #geom_smooth(method="lm",data=subset(agg_fpvar[[j]],N>1 & imp==0),aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  #geom_smooth(data=subset(agg_fpvar[[j]], N > 1 & sex==0 & imp == 0),mapping=aes(x=age_cut,y=x),inherit.aes=F,se=F,lty=2,method="gam",formula=y~s(x,4))+
+  #geom_line(data=data.frame(age=testage,y=exp(predict(mexp,data.frame(age_cut=testage)))),aes(x=age,y=y),inherit.aes=F,lty=2,colour="black")+
+  #geom_line(data=data.frame(age=testage,y=exp(predict(g,data.frame(age_cut=testage)))),aes(x=age,y=y),inherit.aes=F,lty=2,colour="black")+
+  geom_smooth(data=fitdata,aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,se=F,size=1,fullrange=T)+
+  labs(x="Age",title=sprintf("%s (males)",fpVar[j]))+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+}
+
+gm[[length(gm)+1]] = ggplot(data=subset(agg,sex==0 & N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  ##scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+
+marrangeGrob(gm,nrow=2,ncol=3,top="males")
+
+gf =  list()
+for (j in 1:length(agg_fpvar))
+{
+    fitdata = subset(agg_fpvar[[j]], N > 1 & sex==1 & imp == 0 & x > 0 & x_se > 0)
+  Nimp = sum(mmice$where[,fpVar[j]])
+  if(Nimp > 1)
+  {
+    gf[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==1),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se,color=ordered(imp)))
+  }
+  else gf[[j]] = ggplot(data=subset(agg_fpvar[[j]], N > 1 & sex==1),aes(x=age_cut,y=x,ymin=x-x_se,ymax=x+x_se))
+  gf[[j]] = gf[[j]] +  geom_pointrange(position=position_dodge(1))+
+  #geom_smooth(method="lm",data=subset(agg_fpvar[[j]],N>1 & imp==0),aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  #geom_smooth()+
+  geom_smooth(data=fitdata,aes(x=age_cut,y=x,weight=1/x_se^2),lty=2,inherit.aes=F,se=F,size=1)+
+  labs(x="Age",title=sprintf("%s (females)",fpVar[j]))+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+}
+
+
+#females
+gf[[length(gf)+1]] = ggplot(data=subset(agg,sex==1 & N > 1),aes(x=age_cut,y=Nfp,ymin=Nfp-Nfp_se,ymax=Nfp+Nfp_se,color=ordered(Nimp)))+
+  geom_pointrange()+
+  geom_smooth(se=F)+
+  #scale_y_log10()+
+  #annotation_logticks(sides="l")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+
+marrangeGrob(gf,nrow=2,ncol=3,top="females")
+
+
+save=T
+if(save)
+{   
+    ggsave(sprintf("%s/results/hrs_mice_cart_males_fp.pdf",outputDir),
+           marrangeGrob(gm,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+    ggsave(sprintf("%s/results/hrs_mice_cart_males_fp.png",outputDir),
+           marrangeGrob(gm,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+    
+      ggsave(sprintf("%s/results/hrs_mice_cart_females_fp.pdf",outputDir),
+           marrangeGrob(gf,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+    ggsave(sprintf("%s/results/hrs_mice_cart_females_fp.png",outputDir),
+           marrangeGrob(gf,nrow=2,ncol=3,top=NULL),width=16,height=9,dpi=300)
+}
+```
+
+pooled cart
+```{r}
+save = T
+load = T
+file = sprintf("%s/data/hrs_fi_vs_fp_mice_cart.rds",outputDir)
+if(file.exists(file) & load)
+{
+  print("file found, loading...")
+  mcart = readRDS(file)
+} else
+{
+  print("file not found, computing...")
+  #mcart = mice(long[,setdiff(colnames(long),"wave")], meth = "cart", m = 1, maxit= 1, print = T)
+  mcart = mice(long, meth = methCart,pred=predCart, m = 15, print = T)
+  if(save) saveRDS(mcart,file)
+}
+
+```
+
+
+
+#
+# Missingness statistics
+#
+```{r}
+plotdata = data.frame(missingness = apply(is.na(long),2,mean),names=colnames(long),
+                      N = nrow(long)
+                      )
+#not sure what error is...
+#https://www.researchgate.net/post/Can-standard-deviation-and-standard-error-be-calculated-for-a-binary-variable
+#sqrt(p.est*(1-p.est)/n)
+plotdata[,"se"] = sqrt(plotdata[,"missingness"]*(1-plotdata[,"missingness"])/plotdata[,"N"])
+plotdata[,"names"] = factor(plotdata[,"names"],plotdata[sort.list(plotdata[,"missingness"],decreasing=T),"names"])
+ggplot(plotdata,aes(x=names,y=missingness,ymin=missingness-se,ymax=missingness+se))+
+  geom_pointrange()+
+  labs(x="")+
+  theme_minimal()+
+  theme(axis.text.x=element_text(angle=90,vjust=.5))
+```
+
+Just a few variables dominate the missingness, namely weight and gait speed.
+
+```{r}
+#relation between missingness and health
+plotdata = data.frame(missing = apply(is.na(long),1,sum))
+
+plotdata[,"fi"] = apply(long[,fiVar],1,mean,na.rm=T)
+plotdata[,"age"] = long[,"age"]
+plotdata[,"fic"] = cut(plotdata[,"fi"],c(-Inf,.1,.21,.45,Inf)) #blodgett cuts
+plotdata[,"agec"] = cut(plotdata[,"age"],c(0,60,70,80,Inf))
+ggplot(plotdata,aes(x=fi,y=missing,colour=agec,shape=agec))+geom_point()+geom_smooth()
+```
+
+No obvious connection between FI, age and missingness.
+
+```{r}
+#relation between missingness and health
+plotdata = data.frame(missingNFP = apply(is.na(long[,fpVar]),1,sum))
+
+plotdata[,"fi"] = apply(long[,fiVar],1,mean,na.rm=T)
+plotdata[,"age"] = long[,"age"]
+plotdata[,"fic"] = cut(plotdata[,"fi"],c(-Inf,.1,.21,.45,Inf)) #blodgett cuts
+plotdata[,"agec"] = cut(plotdata[,"age"],c(0,60,70,80,Inf))
+ggplot(plotdata,aes(x=age,y=missingNFP,colour=fic,shape=fic))+stat_summary()+geom_smooth()
+```
+
+```{r}
+stop("depricated code")
+```
+
+```{r}
+gm =  list()
+gm[[1]] = ggplot(data=subset(agg, N > 1 & sex==0),aes(x=age_cut,y=fp1_weight,ymin=fp1_weight-fp1_weight_se,ymax=fp1_weight+fp1_weight_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp1_weight,weight=1/fp1_weight_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp1 weight (males)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gm[[2]] = ggplot(data=subset(agg, N > 1 & sex==0),aes(x=age_cut,y=fp2_grip,ymin=fp2_grip-fp2_grip_se,ymax=fp2_grip+fp2_grip_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp2_grip,weight=1/fp2_grip_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp2 grip (males)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gm[[3]] = ggplot(data=subset(agg, N > 1 & sex==0),aes(x=age_cut,y=fp3_gait,ymin=fp3_gait-fp3_gait_se,ymax=fp3_gait+fp3_gait_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp3_gait,weight=1/fp3_gait_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp3 gait (males)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gm[[4]] = ggplot(data=subset(agg, N > 1 & sex==0),aes(x=age_cut,y=fp4_exhaustion,ymin=fp4_exhaustion-fp4_exhaustion_se,ymax=fp4_exhaustion+fp4_exhaustion_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp4_exhaustion,weight=1/fp4_exhaustion_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp4 exhaustion (males)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gm[[5]] = ggplot(data=subset(agg, N > 1 & sex==0),aes(x=age_cut,y=fp5_low_activity,ymin=fp5_low_activity-fp5_low_activity_se,ymax=fp5_low_activity+fp5_low_activity_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp5_low_activity,weight=1/fp5_low_activity_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp5 low activity (males)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+marrangeGrob(gm,nrow=2,ncol=3,top="males")
+
+gf =  list()
+gf[[1]] = ggplot(data=subset(agg, N > 1 & sex==1),aes(x=age_cut,y=fp1_weight,ymin=fp1_weight-fp1_weight_se,ymax=fp1_weight+fp1_weight_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp1_weight,weight=1/fp1_weight_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp1 weight (females)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gf[[2]] = ggplot(data=subset(agg, N > 1 & sex==1),aes(x=age_cut,y=fp2_grip,ymin=fp2_grip-fp2_grip_se,ymax=fp2_grip+fp2_grip_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp2_grip,weight=1/fp2_grip_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp2 grip (females)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gf[[3]] = ggplot(data=subset(agg, N > 1 & sex==1),aes(x=age_cut,y=fp3_gait,ymin=fp3_gait-fp3_gait_se,ymax=fp3_gait+fp3_gait_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp3_gait,weight=1/fp3_gait_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp3 gait (females)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gf[[4]] = ggplot(data=subset(agg, N > 1 & sex==1),aes(x=age_cut,y=fp4_exhaustion,ymin=fp4_exhaustion-fp4_exhaustion_se,ymax=fp4_exhaustion+fp4_exhaustion_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp4_exhaustion,weight=1/fp4_exhaustion_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp4 exhaustion (females)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+gf[[5]] = ggplot(data=subset(agg, N > 1 & sex==1),aes(x=age_cut,y=fp5_low_activity,ymin=fp5_low_activity-fp5_low_activity_se,ymax=fp5_low_activity+fp5_low_activity_se,color=ordered(Nimp)))+
+  geom_pointrange(position=position_dodge(1))+
+  geom_smooth(method="lm",data=subset(agg,N>1 & Nimp==0),aes(x=age_cut,y=fp5_low_activity,weight=1/fp5_low_activity_se^2),lty=2,inherit.aes=F,fullrange =T)+
+  labs(x="Age",title="fp5 low activity (females)")+
+  scale_color_discrete_diverging(palette="Blue-Red")+ #Blue-Red 3
+  theme_minimal()
+
+marrangeGrob(gf,nrow=2,ncol=3,top="females")
+```
+
